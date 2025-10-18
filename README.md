@@ -38,14 +38,3 @@ A full-stack tool for monitoring market-moving tweets. It scrapes targeted Twitt
    cd dashboard/react-app
    npm run dev
    ```
-
-## Workflow Notes
-
-- `tweet_monitor.py` handles scheduled scraping and NLP enrichment.
-- `dashboard/backend.py` wraps SQLite access and live fetch endpoint.
-- `.gitignore` omits Tweety session files and local exports.
-- Update `MAX_CAROUSEL_TWEETS` (frontend) or `DEFAULT_LIVE_LIMIT` (backend) to change the default display count.
-
-## License
-
-MIT
