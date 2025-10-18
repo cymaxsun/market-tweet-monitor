@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pkl
+*.log
+
+# Environment
+.env
+.venv/
+venv/
+.env.local
+
+# SQLite backups
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Tweety session / local exports
+twee*-session.tw_session
+user-tweets.json
+
+# Node
+node_modules/
+dist/
+*.cache/
+yarn.lock
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# macOS
+.DS_Store
+tweets.db
