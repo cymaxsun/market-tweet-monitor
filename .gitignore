@@ -21,6 +21,7 @@ venv/
 # Tweety session / local exports
 twee*-session.tw_session
 user-tweets.json
+tweets.db
 
 # Node
 node_modules/

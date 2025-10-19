@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import pandas as pd
 import sqlite3
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -17,6 +19,7 @@ except ImportError:  # pragma: no cover
 
 
 DB_PATH = Path(__file__).resolve().parent.parent / "tweets.db"
+DEFAULT_ACCOUNTS = ["elonmusk", "CathieDWood", "CNBC"]
 
 app = FastAPI(title="Tweet Monitor API")
 
@@ -27,6 +30,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+connected_clients: Set[WebSocket] = set()
+
+
+def _run_monitor_sync() -> None:
+    from tweet_monitor import monitor as monitor_fn  # local import to avoid startup cost
+
+    monitor_fn()
 
 
 def load_tweets_frame() -> pd.DataFrame:
@@ -43,7 +55,7 @@ def load_tweets_frame() -> pd.DataFrame:
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    numeric_cols = ["sentiment", "market_related_prob", "engagement", "likes", "retweets", "replies"]
+    numeric_cols = ["sentiment_prob", "market_related_prob", "engagement", "likes", "retweets", "replies"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -60,7 +72,11 @@ def apply_filters(
     filtered = df.copy()
 
     if username:
-        filtered = filtered[filtered["username"].str.contains(username, case=False, na=False)]
+        normalised = _normalise_username(username)
+        target = normalised.casefold()
+        filtered = filtered[
+            filtered["username"].fillna("").astype(str).str.casefold() == target
+        ]
 
     if start:
         filtered = filtered[filtered["created_at"] >= start]
@@ -76,12 +92,10 @@ def make_summary(df: pd.DataFrame) -> dict:
 
     count = int(len(df))
     market = int(df.get("market_moving", pd.Series(dtype=int)).fillna(0).astype(int).sum())
-    avg_sentiment = float(df.get("sentiment", pd.Series(dtype=float)).mean() or 0.0)
-
+    
     return {
         "count": count,
-        "market_moving": market,
-        "avg_sentiment": round(avg_sentiment, 3),
+        "market_moving": market
     }
 
 
@@ -97,6 +111,7 @@ def serialize_tweets(df: pd.DataFrame) -> List[dict]:
         else:
             created_iso = None
 
+
         records.append(
             {
                 "tweet_id": row.get("tweet_id"),
@@ -104,7 +119,8 @@ def serialize_tweets(df: pd.DataFrame) -> List[dict]:
                 "created_at": created_iso,
                 "text": row.get("text") or "",
                 "cleaned": row.get("cleaned") or row.get("text") or "",
-                "sentiment": float(row.get("sentiment")) if row.get("sentiment") is not None else None,
+                "sentiment": row.get("sentiment") or None,
+                "sentiment_prob": float(row.get("sentiment_prob")) or 0.0,
                 "engagement": int(row.get("engagement")) if pd.notna(row.get("engagement")) else None,
                 "likes": int(row.get("likes")) if pd.notna(row.get("likes")) else None,
                 "retweets": int(row.get("retweets")) if pd.notna(row.get("retweets")) else None,
@@ -113,14 +129,75 @@ def serialize_tweets(df: pd.DataFrame) -> List[dict]:
                 if row.get("market_related_prob") is not None
                 else None,
                 "market_moving": bool(row.get("market_moving")) if row.get("market_moving") is not None else False,
+                "is_retweet": bool(row.get("is_retweet")) if row.get("is_retweet") is not None else False,
+                "retweeted_user": row.get("retweeted_user") or None,
             }
         )
 
     return records
 
 
-DEFAULT_LIVE_LIMIT = 4
+def _ensure_accounts_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS accounts (username TEXT PRIMARY KEY)")
 
+
+def _normalise_username(raw: Optional[str]) -> str:
+    username = (raw or "").strip()
+    while username.startswith("@"):
+        username = username[1:]
+    return username
+
+
+def load_accounts() -> List[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_accounts_table(conn)
+        rows = conn.execute(
+            "SELECT username FROM accounts ORDER BY username COLLATE NOCASE"
+        ).fetchall()
+        seen = set()
+        accounts: List[str] = []
+        for row in rows:
+            handle = _normalise_username(row[0] if row else "")
+            key = handle.lower()
+            if handle and key not in seen:
+                seen.add(key)
+                accounts.append(handle)
+        if accounts:
+            return accounts
+    return []
+
+
+def save_accounts(usernames: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for value in usernames:
+        handle = _normalise_username(value)
+        key = handle.lower()
+        if handle and key not in seen:
+            seen.add(key)
+            cleaned.append(handle)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_accounts_table(conn)
+        conn.execute("DELETE FROM accounts")
+        if cleaned:
+            conn.executemany(
+                "INSERT OR IGNORE INTO accounts(username) VALUES (?)",
+                [(handle,) for handle in cleaned],
+            )
+        conn.commit()
+
+    return cleaned
+
+
+def seed_accounts_table(defaults: List[str]) -> None:
+    existing = load_accounts()
+    if existing:
+        return
+    save_accounts(defaults)
+
+
+DEFAULT_LIVE_LIMIT = 4
 
 class FetchTweetsRequest(BaseModel):
     username: str = Field(..., description="Twitter handle without @")
@@ -134,6 +211,79 @@ def _normalise_username(raw: str) -> str:
         username = username[1:]
     return username
 
+
+class AccountsPayload(BaseModel):
+    accounts: List[str] = Field(default_factory=list, description="Complete watch list of usernames")
+
+
+
+class MonitorNotification(BaseModel):
+    message: Optional[str] = Field(None, description="Optional message for websocket clients")
+    total: Optional[int] = Field(None, description="Total tweets processed during the run")
+    market_movers: Optional[int] = Field(None, description="Count of market-moving tweets detected")
+    timestamp: Optional[float] = Field(None, description="Unix timestamp of the monitor completion")
+
+
+seed_accounts_table(DEFAULT_ACCOUNTS)
+
+
+async def _broadcast_monitor_payload(payload: dict) -> None:
+    if not connected_clients:
+        return
+    message = json.dumps(payload)
+    disconnected: Set[WebSocket] = set()
+    for websocket in connected_clients:
+        try:
+            await websocket.send_text(message)
+        except WebSocketDisconnect:
+            disconnected.add(websocket)
+        except RuntimeError:
+            disconnected.add(websocket)
+    for websocket in disconnected:
+        connected_clients.discard(websocket)
+
+
+@app.post("/api/monitor/run")
+async def monitor_run() -> dict:
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _run_monitor_sync)
+    return {"status": "started"}
+
+
+@app.post("/api/monitor/notify")
+async def monitor_notify(payload: MonitorNotification) -> dict:
+    message = payload.dict(exclude_none=True)
+    if not message:
+        message = {"message": "refresh"}
+    await _broadcast_monitor_payload(message)
+    return {"status": "ok"}
+
+
+@app.websocket("/ws/monitor")
+async def monitor_ws(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        connected_clients.discard(websocket)
+
+
+@app.get("/api/accounts")
+def read_accounts() -> dict:
+    accounts = load_accounts()
+    if not accounts:
+        accounts = [_normalise_username(name) for name in DEFAULT_ACCOUNTS]
+    return {"accounts": accounts}
+
+
+@app.post("/api/accounts")
+def update_accounts(payload: AccountsPayload) -> dict:
+    accounts = save_accounts(payload.accounts)
+    return {"accounts": accounts}
 
 @app.get("/api/tweets")
 def read_tweets(

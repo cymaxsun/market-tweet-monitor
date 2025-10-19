@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import logging
 import os
 import re
 import sqlite3
@@ -11,22 +12,93 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import schedule
-import torch
+import numpy as np
+import tweetnlp
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from tweety import TwitterAsync  # type: ignore
 
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
-accounts = ["elonmusk", "CathieDWood"]
+DEFAULT_ACCOUNTS = ["elonmusk", "CathieDWood", "CNBC"]
 min_engagement = 1000              # Minimum likes + retweets + replies for market-moving
 market_threshold = 0.8            # Probability threshold for market relevance
 db_file = "tweets.db"
 tweet_limit = 2                 # Number of tweets to fetch per account per run
 
+OPTIONAL_TWEET_COLUMNS = {
+    "is_retweet": "INTEGER",
+    "retweeted_user": "TEXT",
+}
+
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("tweet-monitor")
+
+
+def _normalise_handle(value: Optional[str]) -> str:
+    username = (value or "").strip()
+    while username.startswith("@"):
+        username = username[1:]
+    return username
+
+
+def _ensure_accounts_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS accounts (username TEXT PRIMARY KEY)")
+
+
+def load_accounts_from_db(default_accounts: Optional[List[str]] = None) -> List[str]:
+    default_accounts = default_accounts or []
+    cleaned_defaults = []
+    seen = set()
+    for handle in default_accounts:
+        normalised = _normalise_handle(handle)
+        key = normalised.lower()
+        if normalised and key not in seen:
+            seen.add(key)
+            cleaned_defaults.append(normalised)
+
+    if not Path(db_file).exists():
+        if cleaned_defaults:
+            with sqlite3.connect(db_file) as conn:
+                _ensure_accounts_table(conn)
+                conn.executemany(
+                    "INSERT OR IGNORE INTO accounts(username) VALUES (?)",
+                    [(username,) for username in cleaned_defaults],
+                )
+                conn.commit()
+            return cleaned_defaults
+        return []
+
+    with sqlite3.connect(db_file) as conn:
+        _ensure_accounts_table(conn)
+        rows = conn.execute(
+            "SELECT username FROM accounts ORDER BY username COLLATE NOCASE"
+        ).fetchall()
+        seen_accounts: Set[str] = set()
+        accounts: List[str] = []
+        for row in rows:
+            value = row[0] if row else ""
+            username = _normalise_handle(value)
+            key = username.lower()
+            if username and key not in seen_accounts:
+                seen_accounts.add(key)
+                accounts.append(username)
+        if accounts:
+            return accounts
+        if cleaned_defaults:
+            conn.executemany(
+                "INSERT OR IGNORE INTO accounts(username) VALUES (?)",
+                [(username,) for username in cleaned_defaults],
+            )
+            conn.commit()
+            return cleaned_defaults
+    return []
 
 # ----------------------------
 # INITIALIZE AI MODELS
@@ -36,9 +108,11 @@ market_classifier = pipeline(
     model="facebook/bart-large-mnli",
 )
 
-sentiment_tokenizer = AutoTokenizer.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment-latest")
-sentiment_model = AutoModelForSequenceClassification.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment-latest")
+MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+sentiment_tokenizer = AutoTokenizer.from_pretrained(MODEL)
+config = AutoConfig.from_pretrained(MODEL)
 
+model = tweetnlp.Sentiment()
 
 # ----------------------------
 # HELPER FUNCTIONS
@@ -195,45 +269,77 @@ async def _fetch_tweets_async(
     client = await _login_tweety_client()
 
     try:
-        if hasattr(client, "get_user_tweets"):
-            tweets_iterable = await client.get_user_tweets(username=target_username, pages=1)
-        elif hasattr(client, "get_tweets"):
+        logger.info("Fetching tweets for @%s (limit=%s, store=%s)", target_username, limit, store)
+        if hasattr(client, "get_tweets"):
             tweets_iterable = await client.get_tweets(username=target_username, pages=1)
         else:
             raise AttributeError("Tweety client does not expose a tweet retrieval method.")
 
         tweets = list(tweets_iterable or [])
+        logger.debug("Tweety returned %d items for @%s", len(tweets), target_username)
         items: List[Dict[str, Any]] = []
         raw_tweets: List[Any] = []
 
         for tweet in tweets[:limit]:
-            tweet_id = _attr_path(tweet, "id", "tweet_id")
-            created_at = _attr_path(tweet, "created_on", "date", "created_at")
-            text = (
-                _attr_path(tweet, "text", "full_text", "tweet_text", "rawContent", "content") or ""
+            if verbose:
+                logger.debug("Processing tweet payload: %s", _attr_path(tweet, "id", "tweet_id"))
+            tweet_id = _attr_path(tweet, "id")
+            created_at = _attr_path(tweet, "created_on", "date")
+            author_username = _attr_path(
+                tweet,
+                "author.name"
+                "author.username",
+                "author.screen_name",
             )
 
-            likes = _attr_path(
+            base_text = _attr_path(
                 tweet,
-                "stats.likes",
-                "stats.likes_count",
-                "likes",
-                "favorite_count",
-            ) or 0
+                "text",
+            )
+
+            is_retweet = _attr_path(
+                tweet,
+                "is_retweet",
+            )
+            
             retweets = _attr_path(
                 tweet,
-                "stats.retweets",
-                "stats.retweets_count",
-                "retweets",
-                "retweet_count",
+                "retweet_counts",
             ) or 0
-            replies = _attr_path(
-                tweet,
-                "stats.replies",
-                "stats.replies_count",
-                "replies",
-                "reply_count",
-            ) or 0
+
+
+            if is_retweet:
+                retweeted_text = _attr_path(
+                    tweet,
+                    "retweeted_tweet.text",
+                )
+                
+                retweeted_user = _attr_path(
+                    tweet,
+                    "retweeted_tweet.author.name",
+                    "retweeted_tweet.author.username",
+                    "retweeted_tweet.author.screen_name",
+                )
+                likes = _attr_path(
+                    tweet,
+                    "retweeted_tweet.likes",
+                ) or 0
+                replies = _attr_path(
+                    tweet,
+                    "retweeted_tweet.reply_counts",
+                ) or 0
+            else :
+                likes = _attr_path(
+                    tweet,
+                    "likes",
+                ) or 0
+                replies = _attr_path(
+                    tweet,
+                    "reply_counts",
+                ) or 0
+            text = base_text or ""
+
+            
 
             items.append(
                 {
@@ -241,9 +347,12 @@ async def _fetch_tweets_async(
                     "username": target_username,
                     "created_at": created_at,
                     "text": text,
+                    "is_retweet": is_retweet,
                     "likes": int(likes),
                     "retweets": int(retweets),
                     "replies": int(replies),
+                    "retweeted_user": retweeted_user if is_retweet else None,
+                    #"retweeted_text": retweeted_text if is_retweet else None,
                 }
             )
             raw_tweets.append(tweet)
@@ -270,37 +379,17 @@ async def _fetch_tweets_async(
                 raw_tweets = [raw_tweets[idx] for idx in keep_indices]
 
         df = pd.DataFrame(items)
+        logger.debug("Normalised %d rows for @%s", len(df.index), target_username)
         if df.empty:
             print(f"No new tweets for @{target_username}.")
             print(f"Fetched 0 tweets from @{target_username} via tweety-ns")
             return df
 
         df, missing_stats = _enrich_tweet_dataframe(df)
-
-        zero_mask = (df["likes"] == 0) & (df["retweets"] == 0) & (df["replies"] == 0)
-        if zero_mask.any():
-            zero_ids = df.loc[zero_mask, "tweet_id"].tolist()
-            warning_parts = [
-                "Warning: engagement metrics defaulted to 0.",
-                f"Tweets: {', '.join(filter(None, zero_ids)) or 'unknown ids'}.",
-            ]
-            if missing_stats:
-                detail = "; ".join(
-                    f"{tid or 'unknown'} missing {', '.join(fields)}"
-                    for tid, fields in missing_stats
-                )
-                warning_parts.append(f"Missing raw stats for: {detail}.")
-            print(" ".join(warning_parts))
-
-            if verbose:
-                print("Raw tweet payloads with zeroed engagement:")
-                for zero_id in zero_ids:
-                    for raw in raw_tweets:
-                        raw_id = _attr_path(raw, "id", "tweet_id")
-                        if str(raw_id) == str(zero_id):
-                            print(f"--- tweet_id={zero_id} ---")
-                            print(raw)
-                            break
+        if missing_stats:
+            logger.debug(
+                "Engagement stats missing for %d rows while enriching @%s", len(missing_stats), target_username
+            )
 
         if store:
             store_in_sqlite(df, table_name="tweets")
@@ -322,8 +411,10 @@ async def _fetch_tweets_async(
             print(df[display_cols])
 
         print(f"Fetched {len(df)} tweets from @{target_username} via tweety-ns")
+        logger.info("Persisted %d tweets for @%s", len(df.index), target_username)
         return df
     except Exception as exc:
+        logger.exception("Error fetching tweets for @%s via tweety-ns", target_username)
         print(f"Error fetching tweets for {target_username} via tweety-ns: {exc}")
         return pd.DataFrame()
     finally:
@@ -337,6 +428,7 @@ def _enrich_tweet_dataframe(
     engagement_floor: Optional[int] = None,
 ) -> pd.DataFrame:
     if df.empty:
+        logger.debug("Enrichment skipped: empty DataFrame received")
         return df
 
     enriched = df.copy()
@@ -363,9 +455,39 @@ def _enrich_tweet_dataframe(
         if missing_fields:
             missing_stats.append((row.get("tweet_id"), missing_fields))
 
+    if missing_stats:
+        logger.debug("Normalized engagement counts; pending missing stats for %d rows", len(missing_stats))
+
     enriched["cleaned"] = enriched["text"].apply(clean_text)
+    logger.debug("Applied text cleaning for %d rows", len(enriched.index))
+
     enriched["market_related_prob"] = enriched["cleaned"].apply(classify_market_related)
-    enriched["sentiment"] = enriched["cleaned"].apply(analyze_sentiment_finbert)
+    logger.debug("Computed market probabilities")
+
+    sentiment_payloads = enriched["cleaned"].apply(analyze_sentiment)
+    def _extract_sentiment_label(payload):
+        if not isinstance(payload, dict):
+            return "neutral"
+        return payload.get("label")
+    def _extract_sentiment_probability(payload):
+        if not isinstance(payload, dict):
+            return 0.0
+        label = payload.get("label")
+        probabilities = payload.get("probability") or {}
+        value = probabilities.get(label)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    enriched["sentiment"] = sentiment_payloads.apply(_extract_sentiment_label)
+    enriched["sentiment_prob"] = sentiment_payloads.apply(_extract_sentiment_probability)
+
+    logger.debug(
+        "Sentiment enrichment complete: %d labels, %d probabilities",
+        enriched["sentiment"].notna().sum(),
+        enriched["sentiment_prob"].notna().sum(),
+    )
+
     enriched["engagement"] = (
         enriched["likes"] + enriched["retweets"] + enriched["replies"]
     ).astype(int)
@@ -376,6 +498,12 @@ def _enrich_tweet_dataframe(
         (enriched["market_related_prob"] > float(threshold))
         & (enriched["engagement"] > int(engagement_floor))
     ).astype(bool)
+    logger.debug(
+        "Flagged %d market-moving tweets (threshold=%s engagement_floor=%s)",
+        enriched["market_moving"].sum(),
+        threshold,
+        engagement_floor,
+    )
 
     return enriched, missing_stats
 
@@ -393,7 +521,9 @@ def clean_text(text):
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"@\w+", "", text)
     text = re.sub(r"#\w+", "", text)
-    return text
+    text = re.sub(r"^RT\s*:?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def classify_market_related(text):
@@ -408,14 +538,14 @@ def classify_market_related(text):
         return 0.0
 
 
-def analyze_sentiment_finbert(text):
+def analyze_sentiment(text):
     if not isinstance(text, str) or not text.strip():
-        return 0.0
-    inputs = sentiment_tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-    outputs = sentiment_model(**inputs)
-    probs = F.softmax(outputs.logits, dim=1)
-    pos, neu, neg = probs[0]
-    return float(pos - neg)  # +1 = positive, -1 = negative, 0 = neutral
+        return None
+    try:
+        return model.sentiment(text, return_probability=True)
+    except Exception as error:  # pragma: no cover - model failures are logged upstream
+        logger.debug("Sentiment model failure for text '%s': %s", text[:80], error)
+        return None
 
 
 def store_in_sqlite(df, table_name="tweets"):
@@ -441,6 +571,11 @@ def store_in_sqlite(df, table_name="tweets"):
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN tweet_id TEXT")
                 conn.commit()
 
+            for col_name, col_type in OPTIONAL_TWEET_COLUMNS.items():
+                if col_name in df.columns and col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+                    conn.commit()
+
             if "tweet_id" in df.columns:
                 existing_ids = {
                     row[0]
@@ -452,8 +587,20 @@ def store_in_sqlite(df, table_name="tweets"):
                     df = df[~df["tweet_id"].isin(existing_ids)]
 
         if df.empty:
-            print(f"No new rows to insert into '{table_name}'.")
+            logger.debug("No new rows to insert into '%s'.", table_name)
             return
+
+        if "is_retweet" in df.columns:
+            df["is_retweet"] = df["is_retweet"].astype(int)
+        if "retweeted_user" in df.columns:
+            df["retweeted_user"] = (
+                df["retweeted_user"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lstrip("@")
+                .replace({"": None})
+            )
 
         df.to_sql(table_name, conn, if_exists="append", index=False)
 
@@ -471,16 +618,21 @@ def store_in_sqlite(df, table_name="tweets"):
 # MONITOR FUNCTION
 # ----------------------------
 def monitor():
+    monitored_accounts = load_accounts_from_db(DEFAULT_ACCOUNTS)
+    if not monitored_accounts:
+        logger.warning("No accounts configured; skipping monitor run.")
+        return
+
     all_tweets = pd.DataFrame()
 
-    for account in accounts:
+    for account in monitored_accounts:
         df = fetch_tweets(account)
         if df.empty:
             continue
         all_tweets = pd.concat([all_tweets, df], ignore_index=True)
 
     if all_tweets.empty:
-        print("No tweets gathered during this cycle.")
+        logger.info("No tweets gathered during this cycle.")
         return
 
     if "market_moving" in all_tweets.columns:
@@ -490,9 +642,11 @@ def monitor():
 
     market_tweets = all_tweets[market_mask]
     if not market_tweets.empty:
-        print(f"\n--- Market-moving tweets detected at {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-        print(market_tweets[["created_at", "cleaned", "sentiment", "engagement", "market_related_prob"]])
-        store_in_sqlite(market_tweets, table_name="market_moving_tweets")
+        logger.info("Market-moving tweets detected (%d rows).", len(market_tweets))
+        logger.debug(
+            "Sample market movers:\n%s",
+            market_tweets[["created_at", "cleaned", "sentiment", "engagement", "market_related_prob"]].head(),
+        )
 
 
 def evaluate_tweets_from_db(
@@ -524,7 +678,8 @@ def evaluate_tweets_from_db(
         pk_cols = [row["name"] for row in cols_info if row["pk"] == 1]
         pk_col = pk_cols[0] if pk_cols else None
 
-        for col, col_type in computed_cols.items():
+        required_cols = {**OPTIONAL_TWEET_COLUMNS, **computed_cols}
+        for col, col_type in required_cols.items():
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {col_type}")
         conn.commit()
@@ -534,14 +689,3 @@ def evaluate_tweets_from_db(
     finally:
         conn.close()
 
-
-# ----------------------------
-# SCHEDULE MONITORING
-# ----------------------------
-schedule.every(1).hours.do(monitor)  # Run hourly
-
-print("Hourly monitoring started. Call fetch_tweets('@handle', limit=10, verbose=True) for debugging.\n")
-
-# while True:
-#     schedule.run_pending()
-#     time.sleep(60)

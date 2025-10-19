@@ -8,7 +8,7 @@ A full-stack tool for monitoring market-moving tweets. It scrapes targeted Twitt
 - **NLP scoring**: Zero-shot classification for market relevance and RoBERTa sentiment analysis.
 - **SQLite persistence**: Deduplicate by `tweet_id`, compute metrics (engagement, market_moving) before storage.
 - **FastAPI backend**: Filter tweets by handle/date and trigger on-demand fetches.
-- **React dashboard**: Carousel UI showing the latest 4 tweets per query, with live fetch button.
+- **React dashboard**: Monitoring view with configurable watch lists plus an on-demand fetch workspace.
 
 ## Quick Start
 
@@ -38,3 +38,15 @@ A full-stack tool for monitoring market-moving tweets. It scrapes targeted Twitt
    cd dashboard/react-app
    npm run dev
    ```
+
+## Workflow Notes
+
+- `tweet_monitor.py` handles scheduled scraping and NLP enrichment. Run it directly if you want continuous monitoring.
+- `dashboard/backend.py` exposes the REST API and a live fetch endpoint that the UI uses for on-demand requests.
+- The React dashboard has two pages: **Monitoring Dashboard** (watch list management, ranked feed, configurable sort/refresh) and **On-Demand Fetch** (single-handle lookup with sentiment snapshot).
+- `.gitignore` omits Tweety session files, the SQLite database, and other local artifacts.
+- Tweak `MAX_FEED_TWEETS` (frontend) or `DEFAULT_LIVE_LIMIT` (backend) to change how many tweets are surfaced by default.
+
+## License
+
+MIT
