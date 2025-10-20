@@ -4,7 +4,7 @@ A full-stack tool for monitoring market-moving tweets. It scrapes targeted Twitt
 
 ## Features
 
-- **Automated scraping**: Fetch recent tweets using Tweety with cookie/`auth_token` support to avoid API limits.
+- **Automated scraping**: Fetch recent tweets using Tweety
 - **NLP scoring**: Zero-shot classification for market relevance and RoBERTa sentiment analysis.
 - **SQLite persistence**: Deduplicate by `tweet_id`, compute metrics (engagement, market_moving) before storage.
 - **FastAPI backend**: Filter tweets by handle/date and trigger on-demand fetches.
