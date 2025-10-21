@@ -91,13 +91,6 @@ def load_accounts_from_db(default_accounts: Optional[List[str]] = None) -> List[
                 accounts.append(username)
         if accounts:
             return accounts
-        if cleaned_defaults:
-            conn.executemany(
-                "INSERT OR IGNORE INTO accounts(username) VALUES (?)",
-                [(username,) for username in cleaned_defaults],
-            )
-            conn.commit()
-            return cleaned_defaults
     return []
 
 # ----------------------------
@@ -301,7 +294,8 @@ async def _fetch_tweets_async(
                 tweet,
                 "is_retweet",
             )
-            
+
+
             retweets = _attr_path(
                 tweet,
                 "retweet_counts",
@@ -590,8 +584,7 @@ def store_in_sqlite(df, table_name="tweets"):
             logger.debug("No new rows to insert into '%s'.", table_name)
             return
 
-        if "is_retweet" in df.columns:
-            df["is_retweet"] = df["is_retweet"].astype(int)
+        
         if "retweeted_user" in df.columns:
             df["retweeted_user"] = (
                 df["retweeted_user"]
@@ -688,4 +681,3 @@ def evaluate_tweets_from_db(
 
     finally:
         conn.close()
-

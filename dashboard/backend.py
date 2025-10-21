@@ -19,7 +19,6 @@ except ImportError:  # pragma: no cover
 
 
 DB_PATH = Path(__file__).resolve().parent.parent / "tweets.db"
-DEFAULT_ACCOUNTS = ["elonmusk", "CathieDWood", "CNBC"]
 
 app = FastAPI(title="Tweet Monitor API")
 
@@ -191,10 +190,10 @@ def save_accounts(usernames: List[str]) -> List[str]:
 
 
 def seed_accounts_table(defaults: List[str]) -> None:
-    existing = load_accounts()
-    if existing:
+    if not defaults:
         return
-    save_accounts(defaults)
+    if not DB_PATH.exists():
+        save_accounts(defaults)
 
 
 DEFAULT_LIVE_LIMIT = 4
@@ -224,7 +223,6 @@ class MonitorNotification(BaseModel):
     timestamp: Optional[float] = Field(None, description="Unix timestamp of the monitor completion")
 
 
-seed_accounts_table(DEFAULT_ACCOUNTS)
 
 
 async def _broadcast_monitor_payload(payload: dict) -> None:
@@ -275,8 +273,6 @@ async def monitor_ws(websocket: WebSocket):
 @app.get("/api/accounts")
 def read_accounts() -> dict:
     accounts = load_accounts()
-    if not accounts:
-        accounts = [_normalise_username(name) for name in DEFAULT_ACCOUNTS]
     return {"accounts": accounts}
 
 

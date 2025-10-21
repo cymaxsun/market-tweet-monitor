@@ -10,7 +10,6 @@ import SentimentChart from "./components/SentimentChart";
 const API_URL = "/api/tweets";
 const LIVE_FETCH_URL = "/api/tweets/fetch";
 
-const DEFAULT_MONITORED_USERS = ["elonmusk", "CathieDWood", "CNBC"];
 const MAX_FEED_TWEETS = 4;
 
 function normaliseHandle(value) {
@@ -128,16 +127,11 @@ function App() {
         const data = await response.json();
         const accounts = dedupeHandles(data.accounts ?? []);
         if (cancelled) return;
-        if (accounts.length) {
-          setMonitoredUsers(accounts);
-        } else {
-          setMonitoredUsers(DEFAULT_MONITORED_USERS);
-          syncAccounts(DEFAULT_MONITORED_USERS, DEFAULT_MONITORED_USERS);
-        }
+        setMonitoredUsers(accounts);
       } catch (error) {
         if (cancelled) return;
-        setMonitoredUsers(DEFAULT_MONITORED_USERS);
-        setAccountsError(error.message || "Using default watch list.");
+        setMonitoredUsers([]);
+        setAccountsError(error.message || "Failed to load watch list.");
       }
     };
 
